@@ -9,7 +9,7 @@ from typing import List, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ltr_model_v2.lgb")
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ltr_model.lgb")
 
 
 def load_model(model_path: Optional[str] = None):
