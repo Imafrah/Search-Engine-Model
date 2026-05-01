@@ -15,7 +15,7 @@ from features import extract_features
 from ranker import load_model, rerank
 
 # ── Page config ──────────────────────────────────────────────────────
-st.set_page_config(page_title="LTR Search Engine", page_icon="🔍", layout="centered")
+st.set_page_config(page_title="IM Search Engine", page_icon="🔍", layout="centered")
 
 # ── CLI rebuild support ──────────────────────────────────────────────
 # Allows: streamlit run app.py -- --rebuild
