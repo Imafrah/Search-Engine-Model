@@ -1,0 +1,10 @@
+streamlit
+lightgbm
+numpy
+scikit-learn
+rank_bm25
+wikipedia
+tqdm
+requests
+duckduckgo-search
+datasets
