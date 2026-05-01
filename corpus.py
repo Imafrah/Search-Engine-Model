@@ -5,10 +5,15 @@ Fetches documents from 4 real sources:
   1. Wikipedia (category API → full articles)
   2. Reddit (public JSON API)
   3. DuckDuckGo (web search snippets)
-  4. BEIR (SciFact + MS MARCO research datasets)
+  4. BEIR (MS MARCO tech passages only — SciFact removed)
 
 Run standalone:  python corpus.py
-Expected output: 800-1100 documents in ~5-8 minutes.
+Expected output: 800-1200 documents in ~5-8 minutes.
+
+Changes from previous version:
+  - REMOVED SciFact entirely (biomedical papers, useless for tech search)
+  - MS MARCO now filtered to tech-relevant passages only
+  - MS MARCO limit increased: scans 5000, keeps up to 1000 tech-relevant ones
 """
 
 import json
@@ -160,18 +165,14 @@ def _process_reddit_post(post_data: dict) -> Dict | None:
         if not post_id or not title:
             return None
 
-        # Build text content
         text = selftext.strip()
         if len(text) < 100:
-            # For link posts or short self posts, try to get top comment
             comment = _fetch_reddit_comments(permalink)
             text = f"{title} {text} {comment}".strip()
 
-        # Skip if still too short
         if len(text) < 80:
             return None
 
-        # Truncate to max 2000 chars
         text = text[:2000]
 
         return {
@@ -212,7 +213,6 @@ def fetch_reddit() -> List[Dict]:
                         seen_ids.add(doc["doc_id"])
                         docs.append(doc)
 
-            # Respect rate limits
             time.sleep(2)
 
         except Exception as e:
@@ -275,7 +275,6 @@ def fetch_ddg() -> List[Dict]:
 
                 if not href or not body or len(body) < 30:
                     continue
-
                 if href in seen_urls:
                     continue
                 seen_urls.add(href)
@@ -326,11 +325,40 @@ def fetch_ddg() -> List[Dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# SOURCE 4: BEIR DATASETS  (target: 300 docs)
+# SOURCE 4: BEIR — MS MARCO TECH PASSAGES ONLY
+# SciFact removed: biomedical papers have zero relevance for tech search.
+# MS MARCO contains real Bing query-document pairs — perfect for LTR.
+# We scan up to 5000 passages and keep up to 1000 tech-relevant ones.
 # ─────────────────────────────────────────────────────────────────────
 
+# Keywords that must appear in a passage for it to be kept.
+# Covers laptops, phones, monitors, ML/AI, software, gaming, and CS topics.
+TECH_KEYWORDS = {
+    "laptop", "laptops", "notebook", "ultrabook", "chromebook",
+    "macbook", "thinkpad", "dell", "hp", "asus", "lenovo", "acer",
+    "computer", "desktop", "pc", "processor", "cpu", "gpu", "graphics card",
+    "ram", "memory", "ssd", "hard drive", "storage", "motherboard",
+    "monitor", "display", "screen", "resolution", "refresh rate", "hz",
+    "keyboard", "mouse", "webcam", "headphone", "earbuds", "speaker",
+    "phone", "smartphone", "iphone", "android", "samsung", "pixel",
+    "tablet", "ipad", "surface",
+    "python", "javascript", "programming", "coding", "software",
+    "machine learning", "deep learning", "neural network", "ai",
+    "artificial intelligence", "data science", "algorithm",
+    "gaming", "game", "fps", "rtx", "rx", "nvidia", "amd", "intel",
+    "cloud", "server", "database", "linux", "windows", "macos",
+    "router", "wifi", "bluetooth", "wireless", "network",
+    "battery", "charging", "performance", "benchmark", "review",
+    "best", "budget", "affordable", "student", "developer",
+}
+
+
 def fetch_beir() -> List[Dict]:
-    """Load SciFact + MS MARCO subsets from HuggingFace BEIR collections."""
+    """
+    Load MS MARCO passages from HuggingFace BEIR collection.
+    Filters to tech-relevant passages only.
+    SciFact (biomedical) is intentionally excluded.
+    """
     try:
         from datasets import load_dataset
     except ImportError:
@@ -340,60 +368,55 @@ def fetch_beir() -> List[Dict]:
     docs = []
     seen_ids = set()
 
-    # --- SciFact corpus ---
+    logger.info("Loading BEIR MS MARCO corpus (scanning 5000, keeping up to 1000 tech passages)...")
     try:
-        logger.info("Loading BEIR SciFact corpus...")
-        dataset = load_dataset("BeIR/scifact", "corpus", split="corpus")
-        for record in tqdm(dataset, desc="BEIR SciFact", unit="doc"):
-            rid = str(record.get("_id", ""))
-            title = record.get("title", "")
-            text = record.get("text", "")[:2000]
-            if len(text) < 50:
-                continue
-            doc_id = f"beir_{rid}"
-            if doc_id not in seen_ids:
-                seen_ids.add(doc_id)
-                docs.append({
-                    "doc_id": doc_id,
-                    "title": title,
-                    "text": text,
-                    "url": f"https://pubmed.ncbi.nlm.nih.gov/{rid}/",
-                    "source": "beir",
-                })
-        logger.info(f"BEIR SciFact: {len(docs)} docs loaded")
-    except Exception as e:
-        logger.error(f"BEIR SciFact load failed: {e}")
+        dataset = load_dataset(
+            "BeIR/msmarco",
+            "corpus",
+            split="corpus",
+            streaming=True,
+        )
 
-    # --- MS MARCO subset ---
-    scifact_count = len(docs)
-    try:
-        logger.info("Loading BEIR MS MARCO subset (first 500)...")
-        dataset2 = load_dataset("BeIR/msmarco", "corpus", split="corpus",
-                                streaming=True)
-        count = 0
-        for record in tqdm(dataset2, desc="BEIR MSMARCO", unit="doc", total=500):
-            if count >= 500:
+        scanned = 0
+        kept = 0
+        MAX_SCAN = 5000
+        MAX_KEEP = 1000
+
+        for record in tqdm(dataset, desc="BEIR MS MARCO (tech filter)", unit="doc", total=MAX_SCAN):
+            if scanned >= MAX_SCAN or kept >= MAX_KEEP:
                 break
-            rid = str(record.get("_id", ""))
+
+            scanned += 1
             title = record.get("title", "")
-            text = record.get("text", "")[:2000]
-            if len(text) < 50:
-                count += 1
+            text  = record.get("text", "")
+            combined = f"{title} {text}".lower()
+
+            # Skip if no tech keyword found
+            if not any(kw in combined for kw in TECH_KEYWORDS):
                 continue
+
+            # Skip if too short
+            if len(text.strip()) < 50:
+                continue
+
+            rid    = str(record.get("_id", ""))
             doc_id = f"msmarco_{rid}"
+
             if doc_id not in seen_ids:
                 seen_ids.add(doc_id)
                 docs.append({
                     "doc_id": doc_id,
                     "title": title,
-                    "text": text,
+                    "text": text[:2000],
                     "url": f"https://msmarco.org/doc/{rid}",
                     "source": "beir",
                 })
-            count += 1
-        logger.info(f"BEIR MSMARCO: {len(docs) - scifact_count} docs loaded")
+                kept += 1
+
+        logger.info(f"BEIR MS MARCO: scanned {scanned}, kept {kept} tech-relevant passages")
+
     except Exception as e:
-        logger.error(f"BEIR MSMARCO load failed: {e}")
+        logger.error(f"BEIR MS MARCO load failed: {e}")
 
     logger.info(f"BEIR total: {len(docs)} docs")
     return docs
@@ -404,7 +427,7 @@ def fetch_beir() -> List[Dict]:
 # ─────────────────────────────────────────────────────────────────────
 
 def build_corpus(force_rebuild: bool = False) -> List[Dict]:
-    """Build unified corpus from all 4 sources. Cache to corpus.json."""
+    """Build unified corpus from all sources. Cache to corpus.json."""
     if os.path.exists(CORPUS_FILE) and not force_rebuild:
         with open(CORPUS_FILE, "r", encoding="utf-8") as f:
             docs = json.load(f)
@@ -444,12 +467,12 @@ def build_corpus(force_rebuild: bool = False) -> List[Dict]:
         print(f"[FAIL] DuckDuckGo fetch failed: {e}")
         logger.error(f"DuckDuckGo source failed: {e}")
 
-    # --- Source 4: BEIR ---
-    print("\n=== Loading BEIR datasets... ===")
+    # --- Source 4: BEIR MS MARCO (tech filtered) ---
+    print("\n=== Loading BEIR MS MARCO (tech passages only)... ===")
     try:
         beir_docs = fetch_beir()
         all_docs.extend(beir_docs)
-        print(f"[OK] BEIR: {len(beir_docs)} docs")
+        print(f"[OK] BEIR MS MARCO: {len(beir_docs)} tech-relevant passages")
     except Exception as e:
         print(f"[FAIL] BEIR load failed: {e}")
         logger.error(f"BEIR source failed: {e}")
@@ -467,19 +490,19 @@ def build_corpus(force_rebuild: bool = False) -> List[Dict]:
         json.dump(unique_docs, f, indent=2, ensure_ascii=False)
 
     # --- Summary ---
-    wiki_n = sum(1 for d in unique_docs if d["source"] == "wikipedia")
+    wiki_n   = sum(1 for d in unique_docs if d["source"] == "wikipedia")
     reddit_n = sum(1 for d in unique_docs if d["source"] == "reddit")
-    ddg_n = sum(1 for d in unique_docs if d["source"] == "ddg")
-    beir_n = sum(1 for d in unique_docs if d["source"] == "beir")
+    ddg_n    = sum(1 for d in unique_docs if d["source"] == "ddg")
+    beir_n   = sum(1 for d in unique_docs if d["source"] == "beir")
 
     print(f"\n{'='*50}")
     print(f"  CORPUS BUILT SUCCESSFULLY")
     print(f"{'='*50}")
-    print(f"  Total:     {len(unique_docs)} documents")
-    print(f"  Wikipedia: {wiki_n}")
-    print(f"  Reddit:    {reddit_n}")
-    print(f"  DDG:       {ddg_n}")
-    print(f"  BEIR:      {beir_n}")
+    print(f"  Total:          {len(unique_docs)} documents")
+    print(f"  Wikipedia:      {wiki_n}")
+    print(f"  Reddit:         {reddit_n}")
+    print(f"  DuckDuckGo:     {ddg_n}")
+    print(f"  BEIR MS MARCO:  {beir_n}  (tech-filtered, SciFact removed)")
     print(f"{'='*50}")
     print(f"  Saved to: {CORPUS_FILE}")
 
@@ -529,7 +552,8 @@ if __name__ == "__main__":
 
     print("=" * 50)
     print("  Multi-Source Corpus Builder")
-    print("  Sources: Wikipedia | Reddit | DDG | BEIR")
+    print("  Sources: Wikipedia | Reddit | DDG | BEIR MS MARCO")
+    print("  Note: SciFact removed (biomedical, not tech)")
     print("=" * 50)
 
     if force:
